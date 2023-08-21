@@ -12,7 +12,7 @@ from groundingdino.util import box_ops
 from groundingdino.util.slconfig import SLConfig
 from groundingdino.util.utils import clean_state_dict, get_phrases_from_posmap
 from groundingdino.util.vl_utils import create_positive_map_from_span
-
+from groundingdino.models.GroundingDINO.bertwarper import generate_masks_with_special_tokens_and_transfer_map
 
 def plot_boxes_to_image(image_pil, tgt):
     H, W = tgt["size"]
@@ -90,11 +90,41 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold=No
     device = "cuda" if not cpu_only else "cpu"
     model = model.to(device)
     image = image.to(device)
+    
+    captions = [caption]
+    # encoder texts
+    tokenized = model.tokenizer(captions, padding="longest", return_tensors="pt").to(device)
+    specical_tokens = model.tokenizer.convert_tokens_to_ids(["[CLS]", "[SEP]", ".", "?"])
+    
+    (
+        text_self_attention_masks,
+        position_ids,
+        cate_to_token_mask_list,
+    ) = generate_masks_with_special_tokens_and_transfer_map(
+        tokenized, specical_tokens, model.tokenizer)
+
+    if text_self_attention_masks.shape[1] > model.max_text_len:
+        text_self_attention_masks = text_self_attention_masks[
+            :, : model.max_text_len, : model.max_text_len]
+        
+        position_ids = position_ids[:, : model.max_text_len]
+        tokenized["input_ids"] = tokenized["input_ids"][:, : model.max_text_len]
+        tokenized["attention_mask"] = tokenized["attention_mask"][:, : model.max_text_len]
+        tokenized["token_type_ids"] = tokenized["token_type_ids"][:, : model.max_text_len]
+
     with torch.no_grad():
-        outputs = model(image[None], captions=[caption])
+        outputs = model(image[None], tokenized["input_ids"],
+                        tokenized["attention_mask"], position_ids,
+                        tokenized["token_type_ids"], text_self_attention_masks)
+        
+    #with torch.no_grad():
+    #    outputs = model(image[None], captions=[caption])
+        
     logits = outputs["pred_logits"].sigmoid()[0]  # (nq, 256)
     boxes = outputs["pred_boxes"][0]  # (nq, 4)
 
+    #boxes, logits, phrases = predict(model, image, caption, box_threshold, text_threshold, device='cpu')
+    
     # filter output
     if token_spans is None:
         logits_filt = logits.cpu().clone()
@@ -180,7 +210,7 @@ if __name__ == "__main__":
     box_threshold = args.box_threshold
     text_threshold = args.text_threshold
     token_spans = args.token_spans
-
+    
     # make dir
     os.makedirs(output_dir, exist_ok=True)
     # load image
@@ -194,8 +224,6 @@ if __name__ == "__main__":
     # set the text_threshold to None if token_spans is set.
     if token_spans is not None:
         text_threshold = None
-        print("Using token_spans. Set the text_threshold to None.")
-
 
     # run model
     boxes_filt, pred_phrases = get_grounding_output(
