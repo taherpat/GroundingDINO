@@ -8,11 +8,13 @@ from PIL import Image, ImageDraw, ImageFont
 
 import groundingdino.datasets.transforms as T
 from groundingdino.models import build_model
-from groundingdino.util import box_ops
+from groundingdino.util import box_ops, get_tokenlizer
 from groundingdino.util.slconfig import SLConfig
 from groundingdino.util.utils import clean_state_dict, get_phrases_from_posmap
 from groundingdino.util.vl_utils import create_positive_map_from_span
 from groundingdino.models.GroundingDINO.bertwarper import generate_masks_with_special_tokens_and_transfer_map
+from openvino.runtime import Core
+
 
 def plot_boxes_to_image(image_pil, tgt):
     H, W = tgt["size"]
@@ -61,7 +63,7 @@ def load_image(image_path):
 
     transform = T.Compose(
         [
-            T.RandomResize([800], max_size=1333),
+            T.RandomResize([[1200, 800]]), # w, h,  max_size=1333
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
@@ -70,30 +72,29 @@ def load_image(image_path):
     return image_pil, image
 
 
-def load_model(model_config_path, model_checkpoint_path, cpu_only=False):
+def load_model(model_config_path, model_checkpoint_path, device):
+    core = Core()
+    model_read = core.read_model(model_checkpoint_path)
+    model = core.compile_model(model_read, device.upper())
     args = SLConfig.fromfile(model_config_path)
-    args.device = "cuda" if not cpu_only else "cpu"
-    model = build_model(args)
-    checkpoint = torch.load(model_checkpoint_path, map_location="cpu")
-    load_res = model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
-    print(load_res)
-    _ = model.eval()
+    model.tokenizer = get_tokenlizer.get_tokenlizer(args.text_encoder_type)
+    model.max_text_len = args.max_text_len
+    
     return model
 
+def sig(x):
+ return 1/(1 + np.exp(-x))
 
-def get_grounding_output(model, image, caption, box_threshold, text_threshold=None, with_logits=True, cpu_only=False, token_spans=None):
+def get_grounding_output(model, image, caption, box_threshold, text_threshold=None, with_logits=True, token_spans=None):
     assert text_threshold is not None or token_spans is not None, "text_threshould and token_spans should not be None at the same time!"
     caption = caption.lower()
     caption = caption.strip()
     if not caption.endswith("."):
         caption = caption + "."
-    device = "cuda" if not cpu_only else "cpu"
-    model = model.to(device)
-    image = image.to(device)
-    
+        
     captions = [caption]
     # encoder texts
-    tokenized = model.tokenizer(captions, padding="longest", return_tensors="pt").to(device)
+    tokenized = model.tokenizer(captions, padding="longest", return_tensors="pt")
     specical_tokens = model.tokenizer.convert_tokens_to_ids(["[CLS]", "[SEP]", ".", "?"])
     
     (
@@ -112,18 +113,23 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold=No
         tokenized["attention_mask"] = tokenized["attention_mask"][:, : model.max_text_len]
         tokenized["token_type_ids"] = tokenized["token_type_ids"][:, : model.max_text_len]
 
-    with torch.no_grad():
-        outputs = model(image[None], tokenized["input_ids"],
-                        tokenized["attention_mask"], position_ids,
-                        tokenized["token_type_ids"], text_self_attention_masks)
+    inputs = {}
+    input_img = np.expand_dims(image, 0)
+    inputs["img"] = input_img
+    inputs["input_ids"] = tokenized["input_ids"]
+    inputs["attention_mask"] = tokenized["attention_mask"]
+    inputs["token_type_ids"] = tokenized["token_type_ids"]
+    inputs["position_ids"] = position_ids
+    inputs["text_token_mask"] = text_self_attention_masks 
         
-    #with torch.no_grad():
-    #    outputs = model(image[None], captions=[caption])
+    #ov inference
+    outputs = model.infer_new_request(inputs)
         
-    logits = outputs["pred_logits"].sigmoid()[0]  # (nq, 256)
-    boxes = outputs["pred_boxes"][0]  # (nq, 4)
-
-    #boxes, logits, phrases = predict(model, image, caption, box_threshold, text_threshold, device='cpu')
+    prediction_logits_ = np.squeeze(outputs["logits"], 0) #[0]  # prediction_logits.shape = (nq, 256)
+    prediction_logits_ = sig(prediction_logits_)
+    prediction_boxes_ = np.squeeze(outputs["boxes"], 0) #[0]  # prediction_boxes.shape = (nq, 4)
+    logits = torch.from_numpy(prediction_logits_)
+    boxes = torch.from_numpy(prediction_boxes_) 
     
     # filter output
     if token_spans is None:
@@ -177,8 +183,7 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold=No
 
 
 if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser("Grounding DINO example", add_help=True)
+    parser = argparse.ArgumentParser("OpenVINO Grounding DINO example", add_help=True)
     parser.add_argument("--config_file", "-c", type=str, required=True, help="path to config file")
     parser.add_argument(
         "--checkpoint_path", "-p", type=str, required=True, help="path to checkpoint file"
@@ -198,7 +203,7 @@ if __name__ == "__main__":
                         if you would like to detect 'a cat', the token_spans should be '[[[0, 1], [2, 5]], ]', since 'a cat and a dog'[0:1] is 'a', and 'a cat and a dog'[2:5] is 'cat'. \
                         ")
 
-    parser.add_argument("--cpu-only", action="store_true", help="running on cpu only!, default=False")
+    parser.add_argument("--device", "-d",  type=str, default="CPU", help="set device, default: CPU")
     args = parser.parse_args()
 
     # cfg
@@ -210,13 +215,14 @@ if __name__ == "__main__":
     box_threshold = args.box_threshold
     text_threshold = args.text_threshold
     token_spans = args.token_spans
+    device = args.device
     
     # make dir
     os.makedirs(output_dir, exist_ok=True)
     # load image
     image_pil, image = load_image(image_path)
     # load model
-    model = load_model(config_file, checkpoint_path, cpu_only=args.cpu_only)
+    model = load_model(config_file, checkpoint_path, device)
 
     # visualize raw image
     image_pil.save(os.path.join(output_dir, "raw_image.jpg"))
@@ -224,13 +230,15 @@ if __name__ == "__main__":
     # set the text_threshold to None if token_spans is set.
     if token_spans is not None:
         text_threshold = None
-        # run model
         boxes_filt, pred_phrases = get_grounding_output(
-            model, image, text_prompt, box_threshold, text_threshold, cpu_only=args.cpu_only, token_spans=eval(token_spans))
+        model, image, text_prompt, box_threshold, text_threshold, token_spans=eval(token_spans))
+        print("Using token_spans. Set the text_threshold to None.")
     else:
-        # run model
         boxes_filt, pred_phrases = get_grounding_output(
-            model, image, text_prompt, box_threshold, text_threshold, cpu_only=args.cpu_only)
+            model, image, text_prompt, box_threshold, text_threshold, token_spans=None)
+
+    # run model
+    
 
     # visualize pred
     size = image_pil.size

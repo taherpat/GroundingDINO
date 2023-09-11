@@ -17,7 +17,7 @@ from groundingdino.util.utils import get_phrases_from_posmap
 # ----------------------------------------------------------------------------------------------------------------------
 # OLD API
 # ----------------------------------------------------------------------------------------------------------------------
-
+from groundingdino.models.GroundingDINO.bertwarper import generate_masks_with_special_tokens_and_transfer_map
 
 def preprocess_caption(caption: str) -> str:
     result = caption.lower().strip()
@@ -63,9 +63,33 @@ def predict(
 
     model = model.to(device)
     image = image.to(device)
+    
+    captions = [caption]
+    # encoder texts
+    tokenized = model.tokenizer(captions, padding="longest", return_tensors="pt").to(device)
+    specical_tokens = model.tokenizer.convert_tokens_to_ids(["[CLS]", "[SEP]", ".", "?"])
+    
+    (
+        text_self_attention_masks,
+        position_ids,
+        cate_to_token_mask_list,
+    ) = generate_masks_with_special_tokens_and_transfer_map(
+        tokenized, specical_tokens, model.tokenizer)
+
+    if text_self_attention_masks.shape[1] > model.max_text_len:
+        text_self_attention_masks = text_self_attention_masks[
+            :, : model.max_text_len, : model.max_text_len]
+        
+        position_ids = position_ids[:, : model.max_text_len]
+        tokenized["input_ids"] = tokenized["input_ids"][:, : model.max_text_len]
+        tokenized["attention_mask"] = tokenized["attention_mask"][:, : model.max_text_len]
+        tokenized["token_type_ids"] = tokenized["token_type_ids"][:, : model.max_text_len]
 
     with torch.no_grad():
-        outputs = model(image[None], captions=[caption])
+        outputs = model(image[None], tokenized["input_ids"],
+                        tokenized["attention_mask"], position_ids,
+                        tokenized["token_type_ids"], text_self_attention_masks)
+        #outputs = model(image[None], captions=[caption])
 
     prediction_logits = outputs["pred_logits"].cpu().sigmoid()[0]  # prediction_logits.shape = (nq, 256)
     prediction_boxes = outputs["pred_boxes"].cpu()[0]  # prediction_boxes.shape = (nq, 4)
@@ -73,7 +97,7 @@ def predict(
     mask = prediction_logits.max(dim=1)[0] > box_threshold
     logits = prediction_logits[mask]  # logits.shape = (n, 256)
     boxes = prediction_boxes[mask]  # boxes.shape = (n, 4)
-
+    
     tokenizer = model.tokenizer
     tokenized = tokenizer(caption)
     
