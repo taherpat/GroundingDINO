@@ -123,7 +123,12 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold=No
     inputs["text_token_mask"] = text_self_attention_masks 
         
     #ov inference
-    outputs = model.infer_new_request(inputs)
+    request = model.create_infer_request()
+    request.start_async(inputs, share_inputs=False)
+    request.wait()
+    outputs = {}
+    outputs["logits"] = request.get_tensor("logits").data
+    outputs["boxes"] = request.get_tensor("boxes").data
         
     prediction_logits_ = np.squeeze(outputs["logits"], 0) #[0]  # prediction_logits.shape = (nq, 256)
     prediction_logits_ = sig(prediction_logits_)
